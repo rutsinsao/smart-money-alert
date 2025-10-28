@@ -107,20 +107,61 @@ def _match_key(row):
 
 # -------------------- Scrapers --------------------
 
+def _get_html(url, params):
+    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return r.text
+
 def fetch_moneyway(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
     params = {
-        "hidden": "",
-        "shown": "",
-        "timeZone": timezone,
-        "day": day,
-        "refreshInterval": str(REFRESH_SEC_DEFAULT),
-        "order": "Percentage on sign",
-        "min": "0",
-        "max": "100",
+        "hidden": "", "shown": "", "timeZone": timezone, "day": day,
+        "refreshInterval": str(REFRESH_SEC_DEFAULT), "order": "Percentage on sign",
+        "min": "0", "max": "100",
     }
-    r = requests.get(MONEYWAY_URL, params=params, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
+    html = _get_html(MONEYWAY_URL, params)
+
+    # Try pandas.read_html first
+    try:
+        tables = pd.read_html(html)
+        df0 = tables[0].copy()
+        df0.columns = [str(c).strip().replace("
+"," ") for c in df0.columns]
+        # heuristic column mapping
+        colmap = {}
+        for c in df0.columns:
+            lc = c.lower()
+            if "league" in lc: colmap.setdefault("league", c)
+            elif "date" in lc: colmap.setdefault("date", c)
+            elif lc in ("time","kick","ko") or "time" in lc: colmap.setdefault("time", c)
+            elif "home" in lc: colmap.setdefault("home", c)
+            elif lc.strip() == "1": colmap.setdefault("odds1", c)
+            elif lc.strip() == "x": colmap.setdefault("oddsx", c)
+            elif lc.strip() == "2": colmap.setdefault("odds2", c)
+            elif "%" in lc and "1" in lc: colmap.setdefault("pct1", c)
+            elif "%" in lc and "x" in lc: colmap.setdefault("pctx", c)
+            elif "%" in lc and "2" in lc: colmap.setdefault("pct2", c)
+            elif "away" in lc: colmap.setdefault("away", c)
+            elif "volume" in lc: colmap.setdefault("volume", c)
+        if colmap:
+            out = pd.DataFrame()
+            for k,v in colmap.items():
+                out[k] = df0[v]
+            for k in ["odds1","oddsx","odds2","pct1","pctx","pct2","volume"]:
+                if k in out:
+                    out[k] = out[k].map(_num)
+            def pick_sign(r):
+                m = {"1": r.get("pct1"), "X": r.get("pctx"), "2": r.get("pct2")}
+                best = max(m, key=lambda k: m[k] if pd.notna(m[k]) else -1)
+                return pd.Series([best, m[best]], index=["smart_sign","smart_pct"])
+            best = out.apply(pick_sign, axis=1)
+            out = pd.concat([out, best], axis=1)
+            out["match_key"] = out.apply(_match_key, axis=1)
+            return out
+    except Exception:
+        pass
+
+    # Fallback to BeautifulSoup
+    soup = BeautifulSoup(html, "lxml")
     table = soup.find("table")
     if not table:
         return pd.DataFrame()
@@ -128,30 +169,76 @@ def fetch_moneyway(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
     rows = []
     for tr in table.select("tbody tr"):
         tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        if not tds or len(tds) < 10:
+        if len(tds) < 8:
             continue
-        # โครงสร้างโดยรวม (อาจต่างไปบ้างในบางวัน):
-        # [League, Date, Time, Home, odds1, oddsX, odds2, pct1, pctX, pct2, Away, Volume, ...]
-        # ตำแหน่งอาจคลาดเคลื่อนเล็กน้อย ให้ปรับหากจำเป็น
         row = {
-            "league": tds[0],
-            "date": tds[1],
-            "time": tds[2] if len(tds) > 2 else None,
-            "home": tds[3] if len(tds) > 3 else None,
-            "odds1": _num(tds[4]) if len(tds) > 4 else None,
-            "oddsx": _num(tds[5]) if len(tds) > 5 else None,
-            "odds2": _num(tds[6]) if len(tds) > 6 else None,
-            "pct1": _num(tds[7]) if len(tds) > 7 else None,
-            "pctx": _num(tds[8]) if len(tds) > 8 else None,
-            "pct2": _num(tds[9]) if len(tds) > 9 else None,
+            "league": tds[0] if len(tds)>0 else None,
+            "date": tds[1] if len(tds)>1 else None,
+            "time": tds[2] if len(tds)>2 else None,
+            "home": tds[3] if len(tds)>3 else None,
+            "odds1": _num(tds[4]) if len(tds)>4 else None,
+            "oddsx": _num(tds[5]) if len(tds)>5 else None,
+            "odds2": _num(tds[6]) if len(tds)>6 else None,
+            "pct1": _num(tds[7]) if len(tds)>7 else None,
+            "pctx": _num(tds[8]) if len(tds)>8 else None,
+            "pct2": _num(tds[9]) if len(tds)>9 else None,
             "away": tds[-2] if len(tds) >= 2 else None,
             "volume": _num(tds[-1]) if len(tds) >= 1 else None,
         }
-        # หาว่าฝั่งไหน % สูงสุด
-        pct_map = {"1": row["pct1"], "X": row["pctx"], "2": row["pct2"]}
-        best_sign = max(pct_map, key=lambda k: pct_map[k] if pct_map[k] is not None else -1)
+        m = {"1": row["pct1"], "X": row["pctx"], "2": row["pct2"]}
+        best_sign = max(m, key=lambda k: m[k] if m[k] is not None else -1)
         row["smart_sign"] = best_sign
-        row["smart_pct"] = pct_map[best_sign]
+        row["smart_pct"] = m[best_sign]
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["match_key"] = df.apply(_match_key, axis=1)
+    return df
+
+
+def fetch_dropping(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
+    params = {
+        "hidden":"", "shown":"", "timeZone": timezone, "refreshInterval": str(REFRESH_SEC_DEFAULT),
+        "order":"Drop", "min":"0", "max":"100", "day": day
+    }
+    html = _get_html(DROPPING_URL, params)
+
+    # Using BeautifulSoup for open→now extraction
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.find("table")
+    if not table:
+        return pd.DataFrame()
+
+    rows = []
+    for tr in table.select("tbody tr"):
+        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if len(tds) < 10:
+            continue
+        row = {
+            "league": tds[0],
+            "date": tds[1],
+            "time": tds[2] if len(tds)>2 else None,
+            "home": tds[3] if len(tds)>3 else None,
+            "odds1_open": _num(tds[4]) if len(tds)>4 else None,
+            "odds1_now":  _num(tds[5]) if len(tds)>5 else None,
+            "oddsx_open": _num(tds[6]) if len(tds)>6 else None,
+            "oddsx_now":  _num(tds[7]) if len(tds)>7 else None,
+            "odds2_open": _num(tds[8]) if len(tds)>8 else None,
+            "odds2_now":  _num(tds[9]) if len(tds)>9 else None,
+            "away": tds[-2] if len(tds) >= 2 else None,
+            "volume": _num(tds[-1]) if len(tds) >= 1 else None,
+        }
+        def drop_pct(o, n):
+            if o is None or n is None or o == 0: return None
+            return (o - n) / o * 100.0
+        row["drop1"] = drop_pct(row["odds1_open"], row["odds1_now"])
+        row["dropx"] = drop_pct(row["oddsx_open"], row["oddsx_now"])
+        row["drop2"] = drop_pct(row["odds2_open"], row["odds2_now"])
+        dm = {"1": row["drop1"], "X": row["dropx"], "2": row["drop2"]}
+        best = max(dm, key=lambda k: dm[k] if dm[k] is not None else -1)
+        row["drop_sign"] = best
+        row["drop_pct"] = dm[best]
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -248,17 +335,18 @@ def build_app():
         drop_th = st.number_input("Drop ≥ %", min_value=1.0, max_value=50.0, value=DROPPING_THRESHOLD, step=0.5)
         st.caption("Optional Telegram via env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
 
-    # Auto refresh (simple approach: user can manually refresh or re-run; advanced: use streamlit-autorefresh)
-    # Keeping placeholders to avoid background loop in this notebook environment.
+    # Auto refresh (disabled to avoid rerun loops). Use manual Rerun or add streamlit-autorefresh later.
 
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Fetching Moneyway…")
         mw = fetch_moneyway(timezone=tz_choice, day=day_choice)
+        st.caption(f"rows: {len(mw)}")
         st.dataframe(mw, use_container_width=True)
     with col2:
         st.subheader("Fetching Dropping odds…")
         dr = fetch_dropping(timezone=tz_choice, day=day_choice)
+        st.caption(f"rows: {len(dr)}")
         st.dataframe(dr, use_container_width=True)
 
     if mw.empty or dr.empty:
@@ -267,6 +355,16 @@ def build_app():
 
     # รวมข้อมูลตาม match_key
     merged = mw.merge(dr, on="match_key", suffixes=("_mw", "_dr"), how="inner")
+
+    # เลือกคอลัมน์สำคัญเพื่อแสดง
+    show_cols = [
+        "league_mw", "date_mw", "time_mw", "home_mw", "away_mw",
+        "smart_sign", "smart_pct",
+        "drop_sign", "drop_pct",
+        "odds1_mw", "oddsx_mw", "odds2_mw",
+        "odds1_open", "odds1_now", "oddsx_open", "oddsx_now", "odds2_open", "odds2_now",
+        "volume_mw", "volume_dr"
+    ]
 
     # เติมคอลัมน์ volume_dr (ถ้าไม่มีให้สร้างว่าง)
     if "volume_dr" not in merged.columns:
