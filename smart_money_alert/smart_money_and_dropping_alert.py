@@ -110,108 +110,71 @@ def _get_html(url, params):
 # -------------------- Scrapers --------------------
 def fetch_moneyway(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
     params = {
-        "hidden": "",
-        "shown": "",
-        "timeZone": timezone,
-        "day": day,
+        "hidden": "", "shown": "", "timeZone": timezone, "day": day,
         "refreshInterval": str(REFRESH_SEC_DEFAULT),
-        "order": "Percentage on sign",
-        "min": "0",
-        "max": "100",
+        "order": "Percentage on sign", "min": "0", "max": "100",
     }
     html = _get_html(MONEYWAY_URL, params)
-
-    # ทางเลือกที่ 1: pandas.read_html (ถ้า head ตารางมาตรฐาน)
-    try:
-        tables = pd.read_html(html)
-        df0 = tables[0].copy()
-        # ทำความสะอาดชื่อคอลัมน์แบบไม่พึ่ง "\n"
-        df0_cols = []
-        for c in df0.columns:
-            name = re.sub(r"\s+", " ", str(c)).strip()
-            df0_cols.append(name)
-        df0.columns = df0_cols
-
-        # heuristic column mapping
-        colmap = {}
-        for c in df0.columns:
-            lc = c.lower()
-            if "league" in lc:
-                colmap.setdefault("league", c)
-            elif "date" in lc:
-                colmap.setdefault("date", c)
-            elif lc in ("time", "kick", "ko") or "time" in lc:
-                colmap.setdefault("time", c)
-            elif "home" in lc:
-                colmap.setdefault("home", c)
-            elif lc.strip() == "1":
-                colmap.setdefault("odds1", c)
-            elif lc.strip() == "x":
-                colmap.setdefault("oddsx", c)
-            elif lc.strip() == "2":
-                colmap.setdefault("odds2", c)
-            elif "%" in lc and "1" in lc:
-                colmap.setdefault("pct1", c)
-            elif "%" in lc and "x" in lc:
-                colmap.setdefault("pctx", c)
-            elif "%" in lc and "2" in lc:
-                colmap.setdefault("pct2", c)
-            elif "away" in lc:
-                colmap.setdefault("away", c)
-            elif "volume" in lc:
-                colmap.setdefault("volume", c)
-
-        if colmap:
-            out = pd.DataFrame()
-            for k, v in colmap.items():
-                out[k] = df0[v]
-
-            for k in ["odds1", "oddsx", "odds2", "pct1", "pctx", "pct2", "volume"]:
-                if k in out:
-                    out[k] = out[k].map(_num)
-
-            def pick_sign(r):
-                m = {"1": r.get("pct1"), "X": r.get("pctx"), "2": r.get("pct2")}
-                best = max(m, key=lambda k: (m[k] if pd.notna(m[k]) else -1))
-                return pd.Series([best, m[best]], index=["smart_sign", "smart_pct"])
-
-            best = out.apply(pick_sign, axis=1)
-            out = pd.concat([out, best], axis=1)
-            out["match_key"] = out.apply(_match_key, axis=1)
-            return out
-    except Exception:
-        # ถ้า read_html พังหรือหัวคอลัมน์ไม่มาตรฐาน → ไป Soup แทน
-        pass
-
-    # ทางเลือกที่ 2: BeautifulSoup (fallback)
     soup = BeautifulSoup(html, "lxml")
     table = soup.find("table")
     if not table:
         return pd.DataFrame()
 
     rows = []
+    pct_re = re.compile(r"(\d+(?:\.\d+)?)\s*%")  # จับตัวเลขเปอร์เซ็นต์จาก cell
+
     for tr in table.select("tbody tr"):
-        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
-        if len(tds) < 8:
+        tds = tr.find_all("td")
+        if len(tds) < 10:
             continue
+
+        # ดึงข้อความแบบ strip และเก็บสำรองแบบ raw ด้วย
+        txt = [td.get_text(" ", strip=True) for td in tds]
+
+        # โครงหลักคาดหวัง: 0:league,1:date,2:time,3:home,4:1,5:x,6:2,7:%1,8:%x,9:%2, -2:away, -1:volume
+        # ถ้ามีคอลัมน์รูป/ธงแทรก กลางๆ จะทำให้เลื่อน index; เราจะหาค่า % จากช่วงกลางด้วย regex แทน
+        league = txt[0]
+        date = txt[1]
+        time_ = txt[2]
+        home = txt[3]
+
+        # ราคาหลัก 1/X/2
+        def fnum(i):
+            try:
+                return _num(txt[i]) if i < len(txt) else None
+            except Exception:
+                return None
+
+        odds1 = fnum(4)
+        oddsx = fnum(5)
+        odds2 = fnum(6)
+
+        # หาเปอร์เซ็นต์จากช่วงกลางของแถว (กันคอลัมน์เลื่อน)
+        mid = " ".join(txt[4:11])  # ครอบคลุม 1,X,2 และเปอร์เซ็นต์
+        pcts = pct_re.findall(mid)
+        pct1 = _num(pcts[0]) if len(pcts) >= 1 else None
+        pctx = _num(pcts[1]) if len(pcts) >= 2 else None
+        pct2 = _num(pcts[2]) if len(pcts) >= 3 else None
+
+        away = txt[-2] if len(txt) >= 2 else None
+        volume = _num(txt[-1]) if len(txt) >= 1 else None
+
+        # เลือก smart_sign เฉพาะเมื่อมีอย่างน้อยหนึ่งเปอร์เซ็นต์
+        pct_map = {"1": pct1, "X": pctx, "2": pct2}
+        have_any = any(v is not None for v in pct_map.values())
+        if have_any:
+            smart_sign = max(pct_map, key=lambda k: pct_map[k] if pct_map[k] is not None else -1)
+            smart_pct = pct_map[smart_sign]
+        else:
+            smart_sign, smart_pct = None, None
+
         row = {
-            "league": tds[0] if len(tds) > 0 else None,
-            "date": tds[1] if len(tds) > 1 else None,
-            "time": tds[2] if len(tds) > 2 else None,
-            "home": tds[3] if len(tds) > 3 else None,
-            "odds1": _num(tds[4]) if len(tds) > 4 else None,
-            "oddsx": _num(tds[5]) if len(tds) > 5 else None,
-            "odds2": _num(tds[6]) if len(tds) > 6 else None,
-            "pct1": _num(tds[7]) if len(tds) > 7 else None,
-            "pctx": _num(tds[8]) if len(tds) > 8 else None,
-            "pct2": _num(tds[9]) if len(tds) > 9 else None,
-            "away": tds[-2] if len(tds) >= 2 else None,
-            "volume": _num(tds[-1]) if len(tds) >= 1 else None,
+            "league": league, "date": date, "time": time_, "home": home, "away": away,
+            "odds1": odds1, "oddsx": oddsx, "odds2": odds2,
+            "pct1": pct1, "pctx": pctx, "pct2": pct2,
+            "smart_sign": smart_sign, "smart_pct": smart_pct,
+            "volume": volume,
         }
-        m = {"1": row["pct1"], "X": row["pctx"], "2": row["pct2"]}
-        best_sign = max(m, key=lambda k: (m[k] if m[k] is not None else -1))
-        row["smart_sign"] = best_sign
-        row["smart_pct"] = m[best_sign]
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -221,20 +184,14 @@ def fetch_moneyway(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
     return df
 
 
+
 def fetch_dropping(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
     params = {
-        "hidden": "",
-        "shown": "",
-        "timeZone": timezone,
+        "hidden": "", "shown": "", "timeZone": timezone,
         "refreshInterval": str(REFRESH_SEC_DEFAULT),
-        "order": "Drop",
-        "min": "0",
-        "max": "100",
-        "day": day,
+        "order": "Drop", "min": "0", "max": "100", "day": day,
     }
     html = _get_html(DROPPING_URL, params)
-
-    # ใช้ BeautifulSoup เพื่ออ่านรูปแบบ open→now ได้แม่นกว่า
     soup = BeautifulSoup(html, "lxml")
     table = soup.find("table")
     if not table:
@@ -242,38 +199,55 @@ def fetch_dropping(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
 
     rows = []
     for tr in table.select("tbody tr"):
-        tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        tds = tr.find_all("td")
         if len(tds) < 10:
             continue
-        row = {
-            "league": tds[0],
-            "date": tds[1],
-            "time": tds[2] if len(tds) > 2 else None,
-            "home": tds[3] if len(tds) > 3 else None,
-            "odds1_open": _num(tds[4]) if len(tds) > 4 else None,
-            "odds1_now": _num(tds[5]) if len(tds) > 5 else None,
-            "oddsx_open": _num(tds[6]) if len(tds) > 6 else None,
-            "oddsx_now": _num(tds[7]) if len(tds) > 7 else None,
-            "odds2_open": _num(tds[8]) if len(tds) > 8 else None,
-            "odds2_now": _num(tds[9]) if len(tds) > 9 else None,
-            "away": tds[-2] if len(tds) >= 2 else None,
-            "volume": _num(tds[-1]) if len(tds) >= 1 else None,
-        }
+        txt = [td.get_text(" ", strip=True) for td in tds]
+
+        league = txt[0]
+        date = txt[1]
+        time_ = txt[2] if len(txt) > 2 else None
+        home = txt[3] if len(txt) > 3 else None
+
+        def fnum(i):
+            try:
+                return _num(txt[i]) if i < len(txt) else None
+            except Exception:
+                return None
+
+        odds1_open, odds1_now = fnum(4), fnum(5)
+        oddsx_open, oddsx_now = fnum(6), fnum(7)
+        odds2_open, odds2_now = fnum(8), fnum(9)
+
+        away = txt[-2] if len(txt) >= 2 else None
+        volume = _num(txt[-1]) if len(txt) >= 1 else None
 
         def drop_pct(o, n):
             if o is None or n is None or o == 0:
                 return None
             return (o - n) / o * 100.0
 
-        row["drop1"] = drop_pct(row["odds1_open"], row["odds1_now"])
-        row["dropx"] = drop_pct(row["oddsx_open"], row["oddsx_now"])
-        row["drop2"] = drop_pct(row["odds2_open"], row["odds2_now"])
+        drop1 = drop_pct(odds1_open, odds1_now)
+        dropx = drop_pct(oddsx_open, oddsx_now)
+        drop2 = drop_pct(odds2_open, odds2_now)
 
-        dm = {"1": row["drop1"], "X": row["dropx"], "2": row["drop2"]}
-        best = max(dm, key=lambda k: (dm[k] if dm[k] is not None else -1))
-        row["drop_sign"] = best
-        row["drop_pct"] = dm[best]
-        rows.append(row)
+        dm = {"1": drop1, "X": dropx, "2": drop2}
+        have_any = any(v is not None for v in dm.values())
+        if have_any:
+            drop_sign = max(dm, key=lambda k: dm[k] if dm[k] is not None else -1)
+            drop_pct_val = dm[drop_sign]
+        else:
+            drop_sign, drop_pct_val = None, None
+
+        rows.append({
+            "league": league, "date": date, "time": time_, "home": home, "away": away,
+            "odds1_open": odds1_open, "odds1_now": odds1_now,
+            "oddsx_open": oddsx_open, "oddsx_now": oddsx_now,
+            "odds2_open": odds2_open, "odds2_now": odds2_now,
+            "drop1": drop1, "dropx": dropx, "drop2": drop2,
+            "drop_sign": drop_sign, "drop_pct": drop_pct_val,
+            "volume": volume,
+        })
 
     df = pd.DataFrame(rows)
     if df.empty:
