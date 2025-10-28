@@ -1,16 +1,13 @@
 """
-Smart Money + Dropping Odds (1X2) Alert – Streamlit App
+Smart Money + Dropping Odds (1X2) Alert – Streamlit App (full patched)
 
-สิ่งที่สคริปต์นี้ทำ
-- ดึงข้อมูลจาก 2 หน้า:
-  1) Moneyway 1X2 (เปอร์เซ็นต์เงินเทไปที่ผล 1/X/2)
-  2) Dropping Odds 1X2 (ราคาดรอปจากราคาเปิด)
-- แมตช์คู่แข่งขันให้ตรงกัน (home/away และวันที่ ตามเวลา +07:00)
-- เกณฑ์เริ่มต้น:
-  * SMART_MONEY_THRESHOLD = 90.0  (เงินเทไปฝั่งใดฝั่งหนึ่ง ≥ 90%)
-  * DROPPING_THRESHOLD   = 7.0    (ราคาฝั่งเดียวกันดรอป ≥ 7%)
-- เงื่อนไขแจ้งเตือน: ต้องเป็น “คู่เดียวกัน” และ “ผลเดียวกัน (1/X/2) ตรงกันทั้งสองหน้า”
-- แสดงผลพร้อมไฮไลต์สีแดง + toast และส่ง Telegram (ถ้าตั้ง ENV)
+- ดึงข้อมูล 2 หน้า: Moneyway 1X2 และ Dropping Odds 1X2 (arbworld.net)
+- ใช้ cloudscraper (ถ้ามี) + สำรองด้วย requests.Session() เพื่อเลี่ยงกันบอท
+- พาร์สด้วย BeautifulSoup แบบกำหนดตำแหน่งคอลัมน์ + regex จับเปอร์เซ็นต์
+- จับคู่แมตช์ด้วยคีย์: (วันที่, home, away) หลัง normalize
+- เงื่อนไขเตือน: smart money ≥ SMART_MONEY_THRESHOLD และ drop ≥ DROPPING_THRESHOLD
+  และ sign (1/X/2) ตรงกันทั้งสองหน้า
+- มีโหมด debug แสดง title/len ของ HTML ถ้าตารางว่าง
 """
 
 import os
@@ -23,11 +20,11 @@ from bs4 import BeautifulSoup
 import streamlit as st
 from dotenv import load_dotenv
 
-# -------------------- Config --------------------
+# ==================== Config ====================
 load_dotenv()
 
 DEFAULT_TIMEZONE = "+07:00"  # Asia/Bangkok
-DEFAULT_DAY = "Today"        # Today | Tomorrow | All
+DEFAULT_DAY = "All"          # Today | Tomorrow | All
 REFRESH_SEC_DEFAULT = 60
 
 SMART_MONEY_THRESHOLD = 90.0  # %
@@ -37,12 +34,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 HEADERS = {
-    "User-Agent": (
+    "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    ),
-    # เพิ่มเติมบางเว็บจะชอบ header เพิ่ม
+        "Chrome/125.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://arbworld.net/",
 }
@@ -50,10 +45,8 @@ HEADERS = {
 MONEYWAY_URL = "https://arbworld.net/en/moneyway/football-1-x-2"
 DROPPING_URL = "https://arbworld.net/en/dropping-odds/football-1-x-2"
 
-
-# -------------------- Helpers --------------------
+# ==================== Utils ====================
 def _num(s):
-    """แปลงข้อความเป็นตัวเลข float (รองรับ £ , % , ช่องว่าง)"""
     if s is None:
         return None
     s = str(s).replace("£", "").replace(",", "").strip()
@@ -63,9 +56,7 @@ def _num(s):
     except Exception:
         return None
 
-
 def _norm_team(x: str) -> str:
-    """normalize ชื่อทีมเพื่อใช้จับคู่"""
     if not isinstance(x, str):
         return ""
     x = x.strip().lower()
@@ -74,12 +65,7 @@ def _norm_team(x: str) -> str:
     x = re.sub(r"\s{2,}", " ", x)
     return x
 
-
 def _extract_date(s: str):
-    """
-    พยายามแปลงวันที่จากข้อความ (เช่น '28 Oct') เป็น 'YYYY-MM-DD'
-    ถ้าแปลงไม่ได้ ส่งกลับค่าดั้งเดิม
-    """
     try:
         now = datetime.now()
         s_full = f"{s} {now.year}"
@@ -90,24 +76,55 @@ def _extract_date(s: str):
     except Exception:
         return s
 
-
 def _match_key(row):
-    """คีย์สำหรับจับคู่แมตช์: (วันที่, home, away) หลัง normalize"""
     return (
         _extract_date(str(row.get("date", ""))),
         _norm_team(str(row.get("home", ""))),
         _norm_team(str(row.get("away", ""))),
     )
 
-
+# ==================== HTTP helper ====================
 def _get_html(url, params):
-    """ดึง HTML พร้อม header; โยน exception หาก status ไม่ 200"""
-    r = requests.get(url, params=params, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    return r.text
+    """
+    ดึง HTML แบบทนทาน:
+    - ลองใช้ cloudscraper ถ้ามี
+    - สำรองด้วย requests.Session() + pre-warm คุกกี้
+    """
+    # 1) cloudscraper
+    try:
+        import cloudscraper
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+        r = scraper.get(url, params=params, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        if r.text and len(r.text) > 500:
+            return r.text
+    except Exception:
+        pass
 
+    # 2) session
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    try:
+        s.get("https://arbworld.net/", timeout=15)
+    except Exception:
+        pass
 
-# -------------------- Scrapers --------------------
+    last_err = None
+    for _ in range(3):
+        try:
+            r = s.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            if r.text and len(r.text) > 500:
+                return r.text
+        except Exception as e:
+            last_err = e
+    if last_err:
+        raise last_err
+    return ""
+
+# ==================== Scrapers ====================
 def fetch_moneyway(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
     params = {
         "hidden": "", "shown": "", "timeZone": timezone, "day": day,
@@ -121,24 +138,22 @@ def fetch_moneyway(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
         return pd.DataFrame()
 
     rows = []
-    pct_re = re.compile(r"(\d+(?:\.\d+)?)\s*%")  # จับตัวเลขเปอร์เซ็นต์จาก cell
+    pct_re = re.compile(r"(\d+(?:\.\d+)?)\s*%")  # จับตัวเลขเปอร์เซ็นต์ใน cell
 
     for tr in table.select("tbody tr"):
         tds = tr.find_all("td")
         if len(tds) < 10:
             continue
 
-        # ดึงข้อความแบบ strip และเก็บสำรองแบบ raw ด้วย
+        # ดึงข้อความทั้งหมดจากแต่ละ cell
         txt = [td.get_text(" ", strip=True) for td in tds]
 
-        # โครงหลักคาดหวัง: 0:league,1:date,2:time,3:home,4:1,5:x,6:2,7:%1,8:%x,9:%2, -2:away, -1:volume
-        # ถ้ามีคอลัมน์รูป/ธงแทรก กลางๆ จะทำให้เลื่อน index; เราจะหาค่า % จากช่วงกลางด้วย regex แทน
+        # โครงเป็น: league, date, time, home, 1, X, 2, %1, %X, %2, ..., away, volume
         league = txt[0]
         date = txt[1]
         time_ = txt[2]
         home = txt[3]
 
-        # ราคาหลัก 1/X/2
         def fnum(i):
             try:
                 return _num(txt[i]) if i < len(txt) else None
@@ -149,8 +164,8 @@ def fetch_moneyway(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
         oddsx = fnum(5)
         odds2 = fnum(6)
 
-        # หาเปอร์เซ็นต์จากช่วงกลางของแถว (กันคอลัมน์เลื่อน)
-        mid = " ".join(txt[4:11])  # ครอบคลุม 1,X,2 และเปอร์เซ็นต์
+        # หาเปอร์เซ็นต์ด้วย regex เผื่อคอลัมน์เลื่อน
+        mid = " ".join(txt[4:12])
         pcts = pct_re.findall(mid)
         pct1 = _num(pcts[0]) if len(pcts) >= 1 else None
         pctx = _num(pcts[1]) if len(pcts) >= 2 else None
@@ -159,30 +174,26 @@ def fetch_moneyway(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
         away = txt[-2] if len(txt) >= 2 else None
         volume = _num(txt[-1]) if len(txt) >= 1 else None
 
-        # เลือก smart_sign เฉพาะเมื่อมีอย่างน้อยหนึ่งเปอร์เซ็นต์
         pct_map = {"1": pct1, "X": pctx, "2": pct2}
-        have_any = any(v is not None for v in pct_map.values())
-        if have_any:
+        if any(v is not None for v in pct_map.values()):
             smart_sign = max(pct_map, key=lambda k: pct_map[k] if pct_map[k] is not None else -1)
             smart_pct = pct_map[smart_sign]
         else:
             smart_sign, smart_pct = None, None
 
-        row = {
+        rows.append({
             "league": league, "date": date, "time": time_, "home": home, "away": away,
             "odds1": odds1, "oddsx": oddsx, "odds2": odds2,
             "pct1": pct1, "pctx": pctx, "pct2": pct2,
             "smart_sign": smart_sign, "smart_pct": smart_pct,
             "volume": volume,
-        }
-        rows.append(row)
+        })
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
     df["match_key"] = df.apply(_match_key, axis=1)
     return df
-
 
 
 def fetch_dropping(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
@@ -232,8 +243,7 @@ def fetch_dropping(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
         drop2 = drop_pct(odds2_open, odds2_now)
 
         dm = {"1": drop1, "X": dropx, "2": drop2}
-        have_any = any(v is not None for v in dm.values())
-        if have_any:
+        if any(v is not None for v in dm.values()):
             drop_sign = max(dm, key=lambda k: dm[k] if dm[k] is not None else -1)
             drop_pct_val = dm[drop_sign]
         else:
@@ -255,8 +265,7 @@ def fetch_dropping(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
     df["match_key"] = df.apply(_match_key, axis=1)
     return df
 
-
-# -------------------- Alert & UI --------------------
+# ==================== Alerts & UI ====================
 def send_telegram(msg: str):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
@@ -265,7 +274,6 @@ def send_telegram(msg: str):
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
     except Exception:
         pass
-
 
 def build_app():
     st.set_page_config(page_title="Smart Money x Dropping (1X2) Alert", layout="wide")
@@ -277,34 +285,63 @@ def build_app():
         day_choice = st.selectbox("Day", ["Today", "Tomorrow", "All"], index=["Today", "Tomorrow", "All"].index(DEFAULT_DAY))
         refresh_sec = st.number_input("Auto refresh (sec)", min_value=10, max_value=300, value=REFRESH_SEC_DEFAULT, step=10)
         smart_th = st.number_input("Smart money ≥ %", min_value=50.0, max_value=100.0, value=SMART_MONEY_THRESHOLD, step=1.0)
-        drop_th = st.number_input("Drop ≥ %", min_value=1.0, max_value=50.0, value=DROPPING_THRESHOLD, step=0.5)
+        drop_th  = st.number_input("Drop ≥ %", min_value=1.0, max_value=50.0, value=DROPPING_THRESHOLD, step=0.5)
+        show_debug = st.toggle("Show HTML debug (if empty)", value=False)
         st.caption("Optional Telegram via env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
 
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Fetching Moneyway…")
-        mw = fetch_moneyway(timezone=tz_choice, day=day_choice)
+        try:
+            mw = fetch_moneyway(timezone=tz_choice, day=day_choice)
+        except Exception as e:
+            mw = pd.DataFrame()
+            st.error(f"Moneyway error: {e}")
         st.caption(f"rows: {len(mw)}")
         st.dataframe(mw, use_container_width=True)
 
     with col2:
         st.subheader("Fetching Dropping odds…")
-        dr = fetch_dropping(timezone=tz_choice, day=day_choice)
+        try:
+            dr = fetch_dropping(timezone=tz_choice, day=day_choice)
+        except Exception as e:
+            dr = pd.DataFrame()
+            st.error(f"Dropping error: {e}")
         st.caption(f"rows: {len(dr)}")
         st.dataframe(dr, use_container_width=True)
+
+    if show_debug and (mw.empty or dr.empty):
+        st.markdown("---")
+        st.subheader("HTML Debug")
+        try:
+            html_mw = _get_html(MONEYWAY_URL, {
+                "hidden":"", "shown":"", "timeZone": tz_choice, "day": day_choice,
+                "refreshInterval": str(REFRESH_SEC_DEFAULT), "order":"Percentage on sign", "min":"0", "max":"100",
+            })
+            soup_mw = BeautifulSoup(html_mw, "lxml")
+            st.write("MW title:", soup_mw.title.string if soup_mw.title else "(no title)", "| len:", len(html_mw))
+        except Exception as e:
+            st.write("MW raw error:", e)
+
+        try:
+            html_dr = _get_html(DROPPING_URL, {
+                "hidden":"", "shown":"", "timeZone": tz_choice, "day": day_choice,
+                "refreshInterval": str(REFRESH_SEC_DEFAULT), "order":"Drop", "min":"0", "max":"100",
+            })
+            soup_dr = BeautifulSoup(html_dr, "lxml")
+            st.write("DR title:", soup_dr.title.string if soup_dr.title else "(no title)", "| len:", len(html_dr))
+        except Exception as e:
+            st.write("DR raw error:", e)
 
     if mw.empty or dr.empty:
         st.warning("ไม่พบข้อมูลเพียงพอจากอย่างน้อยหนึ่งหน้า")
         return
 
-    # รวมข้อมูลตาม match_key
     merged = mw.merge(dr, on="match_key", suffixes=("_mw", "_dr"), how="inner")
 
-    # เติมคอลัมน์ volume_dr (ถ้าไม่มีให้สร้างว่าง)
     if "volume_dr" not in merged.columns:
         merged["volume_dr"] = None
 
-    # กรองตามเงื่อนไข: sign ต้องตรงกัน + smart ≥ th + drop ≥ th
     cond = (
         (merged["smart_sign"] == merged["drop_sign"]) &
         (merged["smart_pct"] >= smart_th) &
@@ -318,7 +355,7 @@ def build_app():
     def _pretty(df: pd.DataFrame):
         if df.empty:
             return df
-        out = pd.DataFrame({
+        return pd.DataFrame({
             "League": df.get("league_mw"),
             "Date": df.get("date_mw"),
             "Time": df.get("time_mw"),
@@ -333,16 +370,13 @@ def build_app():
             "Vol(MW)": df.get("volume_mw"),
             "Vol(DR)": df.get("volume_dr"),
         })
-        return out
 
     pretty_alerts = _pretty(alerts)
     if not pretty_alerts.empty:
-        # ไฮไลต์สีแดง
         def highlight_red(_row):
             return ["background-color: #ffdddd"] * len(_row)
         st.dataframe(pretty_alerts.style.apply(highlight_red, axis=1), use_container_width=True)
 
-        # Toast + Telegram
         for _, r in pretty_alerts.iterrows():
             msg = (
                 f"ALERT: {r['League']} {r['Date']} {r['Time']}\n"
@@ -357,7 +391,6 @@ def build_app():
     st.markdown("---")
     st.subheader("All Matched (ไม่กรองเกณฑ์)")
     st.dataframe(_pretty(merged), use_container_width=True)
-
 
 if __name__ == "__main__":
     build_app()
