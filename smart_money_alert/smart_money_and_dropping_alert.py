@@ -124,7 +124,7 @@ def fetch_moneyway(timezone=DEFAULT_TIMEZONE, day=DEFAULT_DAY):
     try:
         tables = pd.read_html(html)
         df0 = tables[0].copy()
-        df0.columns = [str(c).strip().replace("
+        df0.columns = [str(c).strip().replace("\\n", " ") for c in df0.columns]
 "," ") for c in df0.columns]
         # heuristic column mapping
         colmap = {}
